@@ -1,0 +1,17 @@
+pty "pptp us.pointtoserver.com --nolaunchpppd --debug"
+name purevpn0sxxxxxxxx #enter your purevpn username in place of purevpn0sxxx
+password xxxxxxxx #enter your purevpn account password in place of xxxxx
+remotename PPTP
+require-mppe-128
+require-mschap-v2
+refuse-eap
+refuse-pap
+refuse-chap
+refuse-mschap
+noauth
+debug
+persist
+maxfail 0
+defaultroute
+replacedefaultroute
+usepeerdns
