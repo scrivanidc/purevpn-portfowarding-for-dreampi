@@ -16,6 +16,7 @@ import config_server
 import urllib
 import urllib2
 import iptc
+import requests
 
 from dcnow import DreamcastNowService
 from port_forwarding import PortForwarding
@@ -81,22 +82,107 @@ def update_dns_file():
         pass
 
 
-afo_patcher = None
+##afo_patcher = None
+# Increase the TTL in the IP HDR from 30 to 64
+def add_increased_ttl():
+    table = iptc.Table(iptc.Table.MANGLE)
+    chain = iptc.Chain(table, "PREROUTING")
 
+    rule = iptc.Rule()
+    rule.in_interface = "ppp0"
+    rule.create_target("TTL").ttl_set = str(64)
+
+    chain.insert_rule(rule)
+
+    logger.info("DC TTL increased from 30 to 64")
+    return rule
+
+def remove_increased_ttl(ttl_rule):
+    if ttl_rule:
+        table = iptc.Table(iptc.Table.MANGLE)
+        chain = iptc.Chain(table, "PREROUTING")
+        chain.delete_rule(ttl_rule)
+        logger.info("DC TTL removed")
+
+# Add additional DNAT rules
+def start_dnat_rules():
+    rules = []
+
+    def fetch_replacement_ips():
+        url = "https://shumania.ddns.net/dnat.txt"
+        try:
+            r = requests.get(url, verify=False)
+            r.raise_for_status()
+            return r.text.strip()
+        except requests.exceptions.HTTPError:
+            logging.info(
+            "HTTP error; will skip adding DNAT rules"
+            )
+            return None
+        except requests.exceptions.Timeout:
+            logging.info(
+            "Request timed out; will skip adding DNAT rules"
+            )
+            return None
+        except requests.exceptions.SSLError:
+            logging.info(
+            "SSL error; will skip adding DNAT rules"
+            )
+            return None
+
+    data = fetch_replacement_ips()
+
+    if data is None:
+        logger.info("No DNAT rules added")
+        return None
+
+    for ips in data.splitlines():
+        ip = ips.split()
+        
+        if ip[0] is None:
+            logger.info("Missing SRC in DNAT rule - SKIP")
+            return None
+
+        if ip[1] is None:
+            logger.info("Missing DST in DNAT rule - SKIP")
+            return None
+ 
+        table = iptc.Table(iptc.Table.NAT)
+        chain = iptc.Chain(table, "PREROUTING")
+
+        rule = iptc.Rule()
+        rule.protocol = "tcp"
+        rule.dst = ip[0]
+        rule.create_target("DNAT")
+        rule.target.to_destination = ip[1]
+
+        chain.append_rule(rule)
+        logger.info("DNAT rule appended %s -> %s",ip[0],ip[1])
+        rules.append(rule)
+    return rules
+
+def remove_dnat_rule(drule):
+    if drule:
+        table = iptc.Table(iptc.Table.NAT)
+        chain = iptc.Chain(table, "PREROUTING")
+        chain.delete_rule(drule)
+        logger.info("DNAT rule removed")
 
 def start_afo_patching():
-    global afo_patcher
 
     def fetch_replacement_ip():
         url = "http://dreamcast.online/afo.txt"
         try:
-            return urllib.urlopen(url).read().strip()
-        except IOError:
+            r = requests.get(url)
+            r.raise_for_status()
+            afo_IP = r.text.strip()
+            return afo_IP
+        except requests.exceptions.HTTPError:
             return None
 
     replacement = fetch_replacement_ip()
 
-    if not replacement:
+    if replacement is None:
         logger.warning("Not starting AFO patch as couldn't get IP from server")
         return
 
@@ -111,32 +197,30 @@ def start_afo_patching():
 
     chain.append_rule(rule)
 
-    afo_patcher = rule
     logger.info("AFO routing enabled")
+    return rule
 
 
-def stop_afo_patching():
-    global afo_patcher
-    if afo_patcher:
+def stop_afo_patching(afo_patcher_rule):
+    if afo_patcher_rule:
         table = iptc.Table(iptc.Table.NAT)
         chain = iptc.Chain(table, "PREROUTING")
-        chain.delete_rule(afo_patcher)
+        chain.delete_rule(afo_patcher_rule)
         logger.info("AFO routing disabled")
 
-
-def start_process(name):
+def start_service(name):
     try:
-        logger.info("Starting {} process - Thanks Jonas Karlsson!".format(name))
-        with open(os.devnull, 'wb') as devnull:
+        logger.info("Starting {} process - Thanks ShuoumaDC!".format(name))
+        with open(os.devnull, "wb") as devnull:
             subprocess.check_call(["sudo", "service", name, "start"], stdout=devnull)
     except (subprocess.CalledProcessError, IOError):
         logging.warning("Unable to start the {} process".format(name))
 
 
-def stop_process(name):
+def stop_service(name):
     try:
         logger.info("Stopping {} process".format(name))
-        with open(os.devnull, 'wb') as devnull:
+        with open(os.devnull, "wb") as devnull:
             subprocess.check_call(["sudo", "service", name, "stop"], stdout=devnull)
     except (subprocess.CalledProcessError, IOError):
         logging.warning("Unable to stop the {} process".format(name))
@@ -147,7 +231,7 @@ def get_default_iface_name_linux():
     with open(route) as f:
         for line in f.readlines():
             try:
-                iface, dest, _, flags, _, _, _, _, _, _, _, =  line.strip().split()
+                iface, dest, _, flags, _, _, _, _, _, _, _, = line.strip().split()
                 if dest != '00000000' or not int(flags, 16) & 2:
                     continue
                 return iface
@@ -157,7 +241,7 @@ def get_default_iface_name_linux():
 
 def ip_exists(ip, iface):
     command = ["arp", "-a", "-i", iface]
-    output = subprocess.check_output(command)
+    output = subprocess.check_output(command).decode()
     if ("(%s)" % ip) in output:
         logger.info("IP existed at %s", ip)
         return True
@@ -190,38 +274,38 @@ def autoconfigure_ppp(device, speed):
        Returns the IP allocated to the Dreamcast
     """
 
-    gateway_ip = subprocess.check_output("route -n | grep 'UG[ \t]' | awk '{print $2}'", shell=True)
+    gateway_ip = subprocess.check_output(
+        "route -n | grep 'UG[ \t]' | awk '{print $2}'", shell=True
+    ).decode()
     subnet = gateway_ip.split(".")[:3]
 
-    PEERS_TEMPLATE = """
-{device}
-{device_speed}
-{this_ip}:{dc_ip}
-noauth
-    """.strip()
+    PEERS_TEMPLATE = "{device}\n" "{device_speed}\n" "{this_ip}:{dc_ip}\n" "auth\n"
 
-    OPTIONS_TEMPLATE = """
-debug
-ms-dns {}
-proxyarp
-ktune
-noccp
-    """.strip()
+    OPTIONS_TEMPLATE = "debug\n" "ms-dns {this_ip}\n" "proxyarp\n" "ktune\n" "noccp\n"
+
+    PAP_SECRETS_TEMPLATE = "# Modded from dreampi.py\n" "# INBOUND connections\n" '*       *       ""      *' "\n"
 
     this_ip = find_next_unused_ip(".".join(subnet) + ".100")
     dreamcast_ip = find_next_unused_ip(this_ip)
 
     logger.info("Dreamcast IP: {}".format(dreamcast_ip))
 
-    peers_content = PEERS_TEMPLATE.format(device=device, device_speed=speed, this_ip=this_ip, dc_ip=dreamcast_ip)
+    peers_content = PEERS_TEMPLATE.format(
+        device=device, device_speed=speed, this_ip=this_ip, dc_ip=dreamcast_ip
+    )
 
     with open("/etc/ppp/peers/dreamcast", "w") as f:
         f.write(peers_content)
 
-    options_content = OPTIONS_TEMPLATE.format(this_ip)
+    options_content = OPTIONS_TEMPLATE.format(this_ip=this_ip)
 
     with open("/etc/ppp/options", "w") as f:
         f.write(options_content)
+
+    pap_secrets_content = PAP_SECRETS_TEMPLATE
+
+    with open("/etc/ppp/pap-secrets", "w") as f:
+        f.write(pap_secrets_content)
 
     return dreamcast_ip
 
@@ -230,13 +314,13 @@ ENABLE_SPEED_DETECTION = True  # Set this to true if you want to use wvdialconf 
 
 
 def detect_device_and_speed():
-    MAX_SPEED = 38400
+    MAX_SPEED = 57600
 
     if not ENABLE_SPEED_DETECTION:
         # By default we don't detect the speed or device as it's flakey in later
         # Pi kernels. But it might be necessary for some people so that functionality
         # can be enabled by setting the flag above to True
-        return ("ttyUSB0", MAX_SPEED)
+        return ("ttyACM0", MAX_SPEED)
 
     command = ["wvdialconf", "/dev/null"]
 
@@ -384,6 +468,7 @@ class Modem(object):
 
     def disconnect(self):
         if self._serial and self._serial.isOpen():
+            #self._serial.flush()        
             self._serial.close()
             self._serial = None
             logger.info("Serial interface terminated")
@@ -397,10 +482,10 @@ class Modem(object):
             return
 
         self.reset()
-        #self.send_command("AT+FCLASS=0")  # Enter voice mode
-        #self.send_command("AT+VLS=1")  # Go off-hook
+        self.send_command("AT+FCLASS=8")  # Enter voice mode
+        self.send_command("AT+VLS=1")  # Go off-hook
         #self.send_command("AT+VSM=1,8000")  # 8 bit unsigned PCM
-        #self.send_command("AT+VTX")  # Voice transmission mode
+        self.send_command("AT+VTX")  # Voice transmission mode
 
         self._sending_tone = True
 
@@ -414,22 +499,18 @@ class Modem(object):
         if not self._sending_tone:
             return
 
-        #self._serial.write("\0{}{}\r\n".format(chr(0x10), chr(0x03)))
-        #self.send_escape()
-        #self.send_command("ATH0")  # Go on-hook
-        #self.reset()  # Reset the modem
+        self._serial.write("\0{}{}\r\n".format(chr(0x10), chr(0x03)))
+        self.send_escape()
+        self.send_command("ATH0")  # Go on-hook
+        self.reset()  # Reset the modem
         self._sending_tone = False
 
     def answer(self):
-        #self.reset()
+        self.reset()
         # When we send ATA we only want to look for CONNECT. Some modems respond OK then CONNECT
         # and that messes everything up
-        self.send_command2("ATA")
-        self._serial.write("ATX3")
-        time.sleep(3)
         self.send_command("ATA", ignore_responses=["OK"])
-        #time.sleep(5)
-        time.sleep(2)
+        time.sleep(5)
         logger.info("Call answered!")
         logger.info(subprocess.check_output(["pon", "dreamcast"]))
         logger.info("Connected")
@@ -451,38 +532,6 @@ class Modem(object):
         line = ""
         while True:
             new_data = self._serial.readline().strip()
-
-            if not new_data:
-                continue
-
-            line = line + new_data
-            for resp in VALID_RESPONSES:
-                if resp in line:
-                    logger.info(line[line.find(resp):])
-                    return  # We are done
-
-            if (datetime.now() - start).total_seconds() > timeout:
-                raise IOError("There was a timeout while waiting for a response from the modem")
-
-    def send_command2(self, command, timeout=60, ignore_responses=None):
-        ignore_responses = ignore_responses or []  # Things to completely ignore
-
-        VALID_RESPONSES = ["OK", "ERROR", "CONNECT", "VCON"]
-
-        for ignore in ignore_responses:
-            VALID_RESPONSES.remove(ignore)
-
-        final_command = "%s\r\n" % command
-        self._serial.write(final_command)
-        logger.info(final_command)
-        time.sleep(25)
-
-        start = datetime.now()
-
-        line = ""
-        while True:
-            new_data = self._serial.readline().strip()
-            new_data = "OK"
 
             if not new_data:
                 continue
@@ -531,7 +580,6 @@ class GracefulKiller(object):
 
 def process():
     killer = GracefulKiller()
-    aj = 0
 
     dial_tone_enabled = "--disable-dial-tone" not in sys.argv
 
@@ -588,22 +636,15 @@ def process():
         if mode == "LISTENING":
             modem.update()
             char = modem._serial.read(1).strip()
-            logger.info(aj)
-            aj = aj + 1
-            
-            #if not char:
-            if not aj > 0:
+            if not char:
                 continue
 
-            #if ord(char) == 16:
-            if 16 == 16:
+            if ord(char) == 16:
                 # DLE character
                 try:
-                    #char = modem._serial.read(1)
-                    #digit = int(char)
-                    #logger.info("Heard: %s", digit)
-                    aj = 0
-                    logger.info("USRobotics 56K V.92 Modem is on fire!")
+                    char = modem._serial.read(1)
+                    digit = int(char)
+                    logger.info("Heard: %s", digit)
 
                     mode = "ANSWERING"
                     modem.stop_dial_tone()
@@ -626,9 +667,8 @@ def process():
                     logger.info("Detected modem hang up, going back to listening")
                     time.sleep(5)  # Give the hangup some time
                     break
-
+                time.sleep(0.5)
             dcnow.go_offline()
-
             mode = "LISTENING"
             modem = Modem(device_and_speed[0], device_and_speed[1], dial_tone_enabled)
             modem.connect()
@@ -657,6 +697,10 @@ def enable_prom_mode_on_wlan0():
 
 
 def main():
+    afo_patcher_rule = None
+    ttl_rule = None
+    dnat_rules = []
+    
     try:
         # Don't do anything until there is an internet connection
         while not check_internet_connection():
@@ -664,7 +708,7 @@ def main():
             time.sleep(3)
 
         # Try to update the DNS configuration
-        update_dns_file()
+        #update_dns_file()
 
         # Hack around dodgy Raspberry Pi things
         enable_prom_mode_on_wlan0()
@@ -673,21 +717,29 @@ def main():
         restart_dnsmasq()
 
         config_server.start()
-        start_afo_patching()
-        start_process("dcvoip")
-        start_process("dcgamespy")
-        start_process("dc2k2")
-        start_process("dcdaytona")
+        afo_patcher_rule = start_afo_patching()
+        dnat_rules = start_dnat_rules()
+        ttl_rule = add_increased_ttl()        
+        start_service("dcvoip")
+        start_service("dcgamespy")
+        start_service("dc2k2")
+        start_service("dcdaytona")        
         return process()
     except:
         logger.exception("Something went wrong...")
         return 1
     finally:
-        stop_process("dcdaytona")
-        stop_process("dc2k2")
-        stop_process("dcgamespy")
-        stop_process("dcvoip")
-        stop_afo_patching()
+        stop_service("dc2k2")
+        stop_service("dcgamespy")
+        stop_service("dcvoip")
+        stop_service("dcdaytona")
+        if afo_patcher_rule is not None:
+            stop_afo_patching(afo_patcher_rule)
+        if ttl_rule is not None:
+            remove_increased_ttl(ttl_rule)
+        if dnat_rules is not None:
+            for drule in dnat_rules:
+                remove_dnat_rule(drule)        
 
         config_server.stop()
         logger.info("Dreampi quit successfully")
